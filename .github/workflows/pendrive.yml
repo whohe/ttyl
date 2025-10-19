@@ -201,8 +201,8 @@ jobs:
             su - who -c 'mkdir -p ~/.config/fish'
             su - who -c 'wget -O ~/.config/fish/config.fish https://gist.githubusercontent.com/whohe/5263d28b14e6e58c1296cf9ab5860cac/raw/7126b105eab0af21a462e37a9cef1f91dfc8194f/config.fish'
             su - who -c 'mkdir -p ~/.config/ranger'
-            su - who -c 'wget -O ~/.config/ranger/rifle.conf https://gist.githubusercontent.com/whohe/5046801a255d92ef2fee88cf5fab3626/raw/3e058d0b2cc829d794b099c6d20d3644581e8945/rifle.conf'
-            su - who -c 'wget -O ~/.gitignore https://gist.githubusercontent.com/whohe/5046801a255d92ef2fee88cf5fab3626/raw/3e058d0b2cc829d794b099c6d20d3644581e8945/rifle.conf'
+            su - who -c 'wget -O ~/.config/ranger/rifle.conf https://gist.githubusercontent.com/whohe/5046801a255d92ef2fee88cf5fab3626/raw/11669a14766b16dc566024251932701eb29012cc/rifle.conf'
+            su - who -c 'wget -O ~/.gitconfig https://gist.githubusercontent.com/whohe/9bf4574b1d2d00a613e2/raw/353851b460604737ed6264ff530d40e403ad347d/.gitconfig'
           "
 
 
@@ -229,7 +229,7 @@ jobs:
         id: make_secure_storage
         run: |
           cd scratch
-          dd if=/dev/zero of=crypt.img bs=1M count=777
+          dd if=/dev/zero of=crypt.img bs=1M count=333
           sudo losetup -fP crypt.img
           LOOP=$(losetup -j crypt.img | cut -d: -f1)
           echo -n ${{ secrets.CRYPT_SECRET }} | sudo cryptsetup luksFormat "$LOOP" --batch-mode --key-file -
@@ -277,7 +277,11 @@ jobs:
 
       - name: Make filesystem.squashfs
         run: |
+          rm -rf live.iso
+          rm -rf iso
           mkdir -p image/live
+          df -h
+          ls -lhu .
           sudo mksquashfs filesystem image/live/filesystem.squashfs -e boot -e vmlinuz -e vmlinuz.old -e initrd.img -e initrd.img.old
 
       - name: Make efiboot.img and copy UEFI files
@@ -307,28 +311,36 @@ jobs:
 
       - name: Build hybrid ISO with GRUB BIOS/UEFI
         run: |
-          xorriso \
-            -outdev ./pendrive.iso \
-            -volid pendrive \
-            -map ./image / \
-            -map ./scratch/bios.img /boot/grub/bios.img \
-            -map ./scratch/efiboot.img /EFI/efiboot.img \
-            -boot_image grub grub2_mbr=/usr/lib/grub/i386-pc/boot_hybrid.img \
-            -boot_image grub grub2_boot_info=on \
-            -boot_image any cat_path=/boot/grub/boot.cat \
-            -boot_image isolinux bin_path=/boot/grub/bios.img \
-            -boot_image isolinux no_emul_toc=on \
-            -boot_image any efi_path=/EFI/efiboot.img \
+          xorriso -as mkisofs \
+            -iso-level 3 \
+            -full-iso9660-filenames \
+            -volid "pendrive" \
+            -eltorito-boot boot/grub/bios.img \
+            -no-emul-boot \
+            -boot-load-size 4 \
+            -boot-info-table \
+            --eltorito-catalog boot/grub/boot.cat \
+            --grub2-boot-info \
+            --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
+            -eltorito-alt-boot \
+            -e EFI/efiboot.img \
+            -no-emul-boot \
             -append_partition 2 0xef ./scratch/efiboot.img \
-            -append_partition 3 0x83 ./scratch/crypt.img
+            -append_partition 3 0x83 ./scratch/crypt.img \
+            -output "./pendrive.iso" \
+            -graft-points \
+              "./image" \
+              /boot/grub/bios.img=./scratch/bios.img \
+              /EFI/efiboot.img=./scratch/efiboot.img
 
-      - name: Split ISO into parts
-        run: |
-          sudo cp pendrive.iso /mnt/
-          cd /mnt
-          sudo split -b 2000M pendrive.iso pendrive.iso.part.
-          df -h
-      
+      #- name: Split ISO into parts
+      #  run: |
+      #    sudo mv pendrive.iso /mnt/.
+      #    df -h
+      #    ls -lhu .
+      #    cd /mnt
+      #    ls -lhu .
+      #    sudo split -b 2000M /mnt/pendrive.iso pendrive.iso.part.
       - name: Delete previous ISO file from MEGA locker
         run: |
           megarm --username "${{ secrets.MEGA_USER }}"  --password "${{ secrets.MEGA_PASS }}"  /Root/pendrive.iso || true
@@ -359,27 +371,13 @@ jobs:
           VERSION="pendrive-$(date +%Y%m%d-%H%M%S)"
           ISO_HASH=$(sha256sum pendrive.iso | awk '{print $1}')
           BODY="🔗 [Descargar ISO desde MEGA](${{ steps.mega_link.outputs.link }})<br><br>"
-          BODY+="🔐 **Verificación de integridad (SHA-256):**<br>"
+          BODY+="**Verificación de integridad (SHA-256):**<br>"
           BODY+="\`${ISO_HASH}\`<br><br>"
           BODY+="Para verificar la integridad de la ISO, ejecuta:<br>"
           BODY+="\`sha256sum pendrive.iso\` y asegúrate de que el resultado coincida con la firma mostrada arriba."
           sha256sum pendrive.iso > pendrive.iso.sha256
           gh release create latest-release pendrive.iso.sha256 --title "Release pendrive.iso" --notes "$BODY" --latest
 
-      - name: Upload part aa
-        run: gh release upload latest-release /mnt/pendrive.iso.part.aa --clobber
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Upload part ab
-        run: gh release upload latest-release /mnt/pendrive.iso.part.ab --clobber
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
-      - name: Upload part ac
-        run: gh release upload latest-release /mnt/pendrive.iso.part.ac --clobber
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Make commit with signatures and version info
         env:
