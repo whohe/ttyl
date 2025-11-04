@@ -1,0 +1,412 @@
+name: Live USB ISO Image Builder with Gnome
+
+#on:
+#  schedule:
+#    - cron: '30 10 * * *' 
+
+on:
+  push:
+    branches:
+      - '**'  # Esto incluye todas las ramas
+
+permissions:
+  contents: write
+
+jobs:
+  make-mikasa-iso:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget p7zip-full debootstrap squashfs-tools mtools dosfstools grub-pc-bin xorriso megatools
+
+      - name: Get oficial debian live image 
+        run: |
+          wget -O live.iso https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/$(wget -qO- https://cdimage.debian.org/debian-cd/current-live/amd64/iso-hybrid/ | grep -oP 'debian-live-[\d\.]+-amd64-gnome\.iso' | head -n1)
+          echo "Descarga completada"
+
+      - name: Decompress ISO into ./iso folder
+        run: 7z x live.iso -oiso
+
+      - name: Copy initram and kernel from oficial distribution 
+        id: get_kernel
+        run: |
+          sudo cp ./iso/live/initrd.img-*-amd64 image/initrd
+          sudo cp ./iso/live/vmlinuz-*-amd64 image/vmlinuz
+          version=$(basename ./iso/live/vmlinuz-*-amd64 | sed 's/vmlinuz-//')
+          echo "kernel_version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Copy boot y grub signed from oficial distribution
+        run: |
+          sudo cp ./iso/EFI/boot/bootx64.efi scratch/.
+          sudo cp ./iso/EFI/boot/grubx64.efi scratch/.
+
+      - name: Make debootstrap project
+        run: |
+          sudo debootstrap --arch=amd64 --variant=minbase trixie filesystem https://deb.debian.org/debian
+
+      - name: Copy custom sources.list 
+        run: |
+          sudo cp sources.list filesystem/etc/apt/sources.list
+
+      - name: Copy packages.txt to debootstarp project
+        run: |
+          cp packages.txt filesystem/tmp/packages.txt
+
+      - name: Bind mount 
+        run: |
+          sudo mount --bind /dev filesystem/dev
+          sudo mount --bind /proc filesystem/proc
+          sudo mount --bind /sys filesystem/sys
+          sudo mount --bind /dev/rtc0 filesystem/dev/rtc0
+
+      - name: Set hostname
+        run: |
+          echo "mikasa" | sudo tee filesystem/etc/hostname
+
+      - name: Install locales into filesystem
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            apt-get update
+            apt-get install -y locales 
+            echo 'es_ES.UTF-8 UTF-8' > /etc/locale.gen
+            locale-gen
+            echo 'LANG=es_ES.UTF-8' >> /etc/environment
+            echo 'LANGUAGE=es_ES' >> /etc/environment
+            echo 'LC_ALL=es_ES.UTF-8' >> /etc/environment
+          "
+          
+      - name: Install packages into filesystem 
+        run: |
+          KERNEL_VERSION="${{ steps.get_kernel.outputs.kernel_version }}"
+          sudo chroot filesystem /bin/bash -c "
+            apt-get update &&
+            apt-get install -y linux-image-$KERNEL_VERSION 
+          "
+          sudo chroot filesystem /bin/bash -c "
+            apt-get update
+            xargs -a /tmp/packages.txt apt-get install -y
+          "
+          
+      - name: Install Docker 
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            apt-get install ca-certificates curl -y
+          "
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+          chmod a+r /etc/apt/keyrings/docker.asc
+          echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+            $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+            tee /etc/apt/sources.list.d/docker.list > /dev/null
+          apt-get update
+          apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      - name: Uninstall gnome-software
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            apt autoremove -y gnome-software packagekit
+          "
+
+      - name: Install MegaCMD
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            cd /tmp
+            wget https://mega.nz/linux/repo/Debian_13/amd64/megacmd-Debian_13_amd64.deb
+            apt update
+            apt install -y ./megacmd-Debian_13_amd64.deb
+            rm -f ./megacmd-Debian_13_amd64.deb
+          "
+
+      - name: Install Webinato
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            cd /tmp
+            wget https://d18xxy029a0r0q.cloudfront.net/sc/WebinatoSetup.deb
+            apt update
+            apt install -y ./WebinatoSetup.deb
+            rm -f ./WebinatoSetup.deb
+          "
+
+      - name: Make who user and set password
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            echo 'root:${ROOT_PASSWD}' | chpasswd
+            adduser --disabled-password --gecos '' who
+            echo 'who:${USER_PASSWD}' | chpasswd
+          "
+        env:
+          ROOT_PASSWD: ${{ secrets.ROOT_SECRET }}
+          USER_PASSWD: ${{ secrets.USER_SECRET }}
+
+      - name: docker contains who
+        run: |
+          usermod -aG docker who
+
+
+      - name: Make CRYPT folder
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            mkdir -p /crypt/.mozilla
+            mkdir -p /crypt/.config/goa-1.0
+            mkdir -p /crypt/.local
+            mkdir -p /crypt/.local/share/keyrings/
+            mkdir -p /crypt/.megaCmd
+            mkdir -p /crypt/system-connections
+            chown who:who /crypt -R
+            su - who -c 'mkdir ~/.local/share/keyrings/'
+            su - who -c 'mkdir ~/.config/goa-1.0/'
+            mkdir -p /etc/NetworkManager/system-connections 
+          "
+
+      - name: Set doas privileges
+        run: |
+          echo "permit persist who as root" | sudo tee filesystem/etc/doas.conf
+
+      - name: Change display name of who user
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            usermod -c 'ヽ(⌐■_■)ノ♪♬' who
+          "
+
+      - name: Set Bogota timezone
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            ln -sf /usr/share/zoneinfo/America/Bogota /etc/localtime
+            echo 'America/Bogota' > /etc/timezone
+            DEBIAN_FRONTEND=noninteractive dpkg-reconfigure -f noninteractive tzdata
+          "
+
+      - name: Usar hora BIOS como hora local
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            echo -e '0.0 0 0.0\n0\nLOCAL' > /etc/adjtime
+            hwclock --hctosys --localtime
+          "
+          
+      - name: Make default user folders with xdg-user-dirs-update
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            su - who -c 'xdg-user-dirs-update'
+          "
+
+      - name: Make icons folder of AccountsService
+        run: |
+          sudo mkdir -p filesystem/var/lib/AccountsService/{icons,users}
+          echo -e "[User]\\nSession=\\nIcon=/var/lib/AccountsService/icons/who\\nSystemAccount=false" | sudo tee filesystem/var/lib/AccountsService/users/who > /dev/null
+          sudo cp profile.png filesystem/var/lib/AccountsService/icons/who 
+          sudo mkdir -p filesystem/home/who/.local/share/backgrounds
+          sudo mkdir -p filesystem/home/who/.config/dconf/
+          sudo cp wallpaper.jpg  filesystem/home/who/.local/share/backgrounds/2025-05-06-21-12-24-wallpaper.jpg
+          sudo cp user filesystem/home/who/.config/dconf/.
+          sudo chroot filesystem /bin/bash -c "
+            chown who:who /home/who/.config -R
+            chown who:who /home/who/.local -R
+          "
+
+      - name: Setup vim, tmux and ranger CLI - IDE
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            su - who -c 'git clone https://github.com/whohe/.vim ~/.vim'
+            su - who -c 'cd ~/.vim && git submodule update --init --recursive'
+            su - who -c 'git clone https://github.com/whohe/.tmux ~/.tmux'
+            su - who -c 'cd ~ && ln -s .vim/vimrc .vimrc'
+            su - who -c 'cd ~ && ln -s .tmux/tmux.conf .tmux.conf'
+            su - who -c 'mkdir -p ~/.config/fish'
+            su - who -c 'wget -O ~/.config/fish/config.fish https://gist.githubusercontent.com/whohe/5263d28b14e6e58c1296cf9ab5860cac/raw/7126b105eab0af21a462e37a9cef1f91dfc8194f/config.fish'
+            su - who -c 'mkdir -p ~/.config/ranger'
+            su - who -c 'wget -O ~/.config/ranger/rifle.conf https://gist.githubusercontent.com/whohe/5046801a255d92ef2fee88cf5fab3626/raw/11669a14766b16dc566024251932701eb29012cc/rifle.conf'
+            su - who -c 'wget -O ~/.gitconfig https://gist.githubusercontent.com/whohe/9bf4574b1d2d00a613e2/raw/353851b460604737ed6264ff530d40e403ad347d/.gitconfig'
+          "
+
+
+      - name: Setup ufw Firewall
+        run: |
+          sudo chroot filesystem /bin/bash -c "
+            ufw enable
+            ufw default deny incoming
+            ufw default allow outgoing
+          "
+
+      - name: Umount bind folders
+        run: |
+          sudo umount filesystem/dev/rtc0
+          sudo umount filesystem/dev
+          sudo umount filesystem/proc
+          sudo umount filesystem/sys
+
+      - name: Delete packages.txt of filesystem 
+        run: |
+          rm filesystem/tmp/packages.txt
+
+      - name: Make crypt.img and
+        id: make_secure_storage
+        run: |
+          cd scratch
+          dd if=/dev/zero of=crypt.img bs=1M count=333
+          sudo losetup -fP crypt.img
+          LOOP=$(losetup -j crypt.img | cut -d: -f1)
+          echo -n ${{ secrets.CRYPT_SECRET }} | sudo cryptsetup luksFormat "$LOOP" --batch-mode --key-file -
+          LUKS_UUID=$(sudo cryptsetup luksUUID "$LOOP")
+          echo -n ${{ secrets.CRYPT_SECRET }} | sudo cryptsetup open "$LOOP" crypt --key-file -
+          sudo mkfs.ext4 /dev/mapper/crypt
+          UUID=$(sudo blkid -s UUID -o value /dev/mapper/crypt)
+          echo $UUID
+          echo "uuid=$UUID" >> "$GITHUB_OUTPUT"
+          echo "luks_uuid=$LUKS_UUID" >> "$GITHUB_OUTPUT"
+          sudo cryptsetup close crypt
+          sudo losetup -d "$LOOP"
+          sync
+
+      - name: Generate crypttab
+        run: |
+          echo "crypt UUID=${{ steps.make_secure_storage.outputs.luks_uuid }} none luks" | sudo tee filesystem/etc/crypttab
+      
+      - name: Generate fstab
+        run: |
+          echo "/dev/mapper/crypt /crypt ext4 defaults,nofail,x-systemd.requires=systemd-cryptsetup@crypt.service 0 2" | sudo tee filesystem/etc/fstab
+          echo "/crypt/.mozilla/ /home/who/.mozilla none bind,nofail,x-systemd.requires=systemd-cryptsetup@crypt.service 0 0" | sudo tee -a filesystem/etc/fstab
+          echo "/crypt/.config/goa-1.0 /home/who/.config/goa-1.0 none bind,nofail,x-systemd.requires=systemd-cryptsetup@crypt.service 0 0" | sudo tee -a filesystem/etc/fstab
+          echo "/crypt/.local/share/keyrings /home/who/.local/share/keyrings none bind,nofail,x-systemd.requires=systemd-cryptsetup@crypt.service 0 0" | sudo tee -a filesystem/etc/fstab
+          echo "/crypt/system-connections /etc/NetworkManager/system-connections none bind,nofail,x-systemd.requires=systemd-cryptsetup@crypt.service 0 0" | sudo tee -a filesystem/etc/fstab
+          echo "/crypt/.megaCmd /home/who/.megaCmd none bind,nofail,x-systemd.requires=systemd-cryptsetup@crypt.service 0 0" | sudo tee -a filesystem/etc/fstab
+
+      - name: Configure MegaCMD systemd services
+        run: |
+          sudo cp services/megacmd-server.service filesystem/etc/systemd/system/megacmd-server.service
+          #sudo cp services/megasync-preconfig.service filesystem/etc/systemd/system/megasync-preconfig.service
+          sudo chroot filesystem /bin/bash -c "
+            systemctl enable megacmd-server.service
+            #systemctl enable megasync-preconfig.service
+          "
+
+      - name: Crear override para NetworkManager
+        run: |
+          sudo mkdir -p filesystem/etc/systemd/system/NetworkManager.service.d
+          cat <<'EOF' | sudo tee filesystem/etc/systemd/system/NetworkManager.service.d/override.conf
+          [Unit]
+          Wants=etc-NetworkManager-system\x2dconnections.mount
+          After=etc-NetworkManager-system\x2dconnections.mount
+          EOF
+
+      - name: Make filesystem.squashfs
+        run: |
+          rm -rf live.iso
+          rm -rf iso
+          mkdir -p image/live
+          df -h
+          ls -lhu .
+          sudo mksquashfs filesystem image/live/filesystem.squashfs -e boot -e vmlinuz -e vmlinuz.old -e initrd.img -e initrd.img.old
+
+      - name: Make efiboot.img and copy UEFI files
+        run: |
+          cd scratch
+          dd if=/dev/zero of=efiboot.img bs=1M count=10
+          mkfs.vfat efiboot.img
+          mmd -i efiboot.img efi efi/boot
+          mcopy -i efiboot.img ./bootx64.efi ::efi/boot/
+          mcopy -i efiboot.img ./grubx64.efi ::efi/boot/
+
+      - name: Generate core.img with grub-mkstandalone
+        run: |
+          grub-mkstandalone \
+            --format=i386-pc \
+            --output=scratch/core.img \
+            --install-modules="linux normal iso9660 biosdisk memdisk search tar ls" \
+            --modules="linux normal iso9660 biosdisk search" \
+            --locales="" \
+            --fonts="" \
+            "boot/grub/grub.cfg=image/boot/grub/grub.cfg"
+
+      - name: make bios.img from cdboot.img and core.img
+        run: |
+          cat /usr/lib/grub/i386-pc/cdboot.img scratch/core.img > /tmp/bios.img
+          mv /tmp/bios.img scratch/bios.img
+
+      - name: Build hybrid ISO with GRUB BIOS/UEFI
+        run: |
+          xorriso -as mkisofs \
+            -iso-level 3 \
+            -full-iso9660-filenames \
+            -volid "mikasa" \
+            -eltorito-boot boot/grub/bios.img \
+            -no-emul-boot \
+            -boot-load-size 4 \
+            -boot-info-table \
+            --eltorito-catalog boot/grub/boot.cat \
+            --grub2-boot-info \
+            --grub2-mbr /usr/lib/grub/i386-pc/boot_hybrid.img \
+            -eltorito-alt-boot \
+            -e EFI/efiboot.img \
+            -no-emul-boot \
+            -append_partition 2 0xef ./scratch/efiboot.img \
+            -append_partition 3 0x83 ./scratch/crypt.img \
+            -output "./mikasa.iso" \
+            -graft-points \
+              "./image" \
+              /boot/grub/bios.img=./scratch/bios.img \
+              /EFI/efiboot.img=./scratch/efiboot.img
+
+      #- name: Split ISO into parts
+      #  run: |
+      #    sudo mv mikasa.iso /mnt/.
+      #    df -h
+      #    ls -lhu .
+      #    cd /mnt
+      #    ls -lhu .
+      #    sudo split -b 2000M /mnt/mikasa.iso mikasa.iso.part.
+      - name: Delete previous ISO file from MEGA locker
+        run: |
+          megarm --username "${{ secrets.MEGA_USER }}"  --password "${{ secrets.MEGA_PASS }}"  /Root/mikasa.iso || true
+
+      - name: Upload current ISO file to MEGA locker
+        run: |
+          megaput --username "${{ secrets.MEGA_USER }}"  --password "${{ secrets.MEGA_PASS }}"  mikasa.iso
+
+      - name: Get public link
+        id: mega_link
+        run: |
+          LINK=$(megaexport --username "${{ secrets.MEGA_USER }}" --password "${{ secrets.MEGA_PASS }}" /Root/mikasa.iso)
+          echo "🔗 Enlace: $LINK"
+          echo "link=$LINK" >> $GITHUB_OUTPUT
+      
+      - name: Delete previous release and tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-release --yes || true
+          git push --delete origin latest-release || true
+          git tag -d latest-release || true
+
+      - name: Make Github Release with MEGA link
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="mikasa-$(date +%Y%m%d-%H%M%S)"
+          ISO_HASH=$(sha256sum mikasa.iso | awk '{print $1}')
+          BODY="🔗 [Descargar ISO desde MEGA](${{ steps.mega_link.outputs.link }})<br><br>"
+          BODY+="**Verificación de integridad (SHA-256):**<br>"
+          BODY+="\`${ISO_HASH}\`<br><br>"
+          BODY+="Para verificar la integridad de la ISO, ejecuta:<br>"
+          BODY+="\`sha256sum mikasa.iso\` y asegúrate de que el resultado coincida con la firma mostrada arriba."
+          sha256sum mikasa.iso > mikasa.iso.sha256
+          gh release create latest-release mikasa.iso.sha256 --title "Release mikasa.iso" --notes "$BODY" --latest
+
+
+      - name: Make commit with signatures and version info
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha256sum mikasa.iso > mikasa.iso.sha256
+          git config user.name "Wilson"
+          git config user.email "wilsonhernandezortiz@gmail.com"
+          git add mikasa.iso.sha256
+          git commit -m "Add sha256 signature for verification purposes"
+          git push
+
